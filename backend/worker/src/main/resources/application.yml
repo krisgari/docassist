@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: worker
+  config:
+    import: classpath:docassist-common.yml
+  kafka:
+    consumer:
+      max-poll-records: 50
+
+server:
+  port: 8090
+
+docassist:
+  connector:
+    root: ${DOCASSIST_CONNECTOR_ROOT:../../corpus}
+    scan-interval-ms: ${DOCASSIST_CONNECTOR_SCAN_INTERVAL_MS:5000}
+  jobs:
+    max-docs: 12
+    # Makes progress visible in mock mode, where each step is otherwise instant.
+    mock-step-delay-ms: 700

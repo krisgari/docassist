@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21", cache: maven }
+      - name: Unit tests
+        run: mvn -B -q test
+        working-directory: backend
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: npm install --no-audit --no-fund
+        working-directory: ui
+      - name: Type-check and build
+        run: npm run build
+        working-directory: ui
+
+  evals:
+    # Full stack in mock mode (no API key): proves permissions, guardrails and the eval gates on every PR.
+    # Add ANTHROPIC_API_KEY as a secret and set DOCASSIST_LLM_PROVIDER=anthropic in a nightly job to gate the real model.
+    needs: [backend, ui]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scorer self-test
+        run: python3 evals/run_evals.py --self-test
+      - name: Start stack
+        run: docker compose up -d --build postgres redis kafka worker query-api
+      - name: Wait for API and initial ingest
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/actuator/health | grep -q UP && break
+            sleep 5
+          done
+          # Connector scans every 5 s; give the pipeline time to index the corpus.
+          for i in $(seq 1 30); do
+            n=$(docker compose exec -T postgres psql -U docassist -tAc "select count(*) from document" || echo 0)
+            [ "$n" -ge 14 ] && break
+            sleep 2
+          done
+      - name: Run golden-set evals
+        run: python3 evals/run_evals.py --api http://localhost:8080 --golden evals/golden.jsonl
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: eval-report, path: evals/reports/ }
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs worker query-api | tail -300

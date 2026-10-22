@@ -1,0 +1,10 @@
+.env
+**/target/
+ui/node_modules/
+ui/dist/
+evals/reports/
+.idea/
+*.iml
+.vscode/
+.DS_Store
+__pycache__/

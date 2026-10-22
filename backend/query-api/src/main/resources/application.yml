@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: query-api
+  config:
+    import: classpath:docassist-common.yml
+  threads:
+    virtual:
+      enabled: true
+  mvc:
+    async:
+      request-timeout: 120000
+
+server:
+  port: 8080
+  shutdown: graceful
+
+docassist:
+  auth:
+    jwt-secret: ${DOCASSIST_JWT_SECRET:change-me-local-dev-secret-at-least-32-bytes!!}
+    token-ttl-minutes: 480
+    demo-login-enabled: ${DOCASSIST_DEMO_LOGIN_ENABLED:true}
+  agent:
+    max-model-calls: 6
+    max-tool-calls: 8
+    sync-budget-seconds: 25
+    grounding-max-failure-rate: 0.2
+    history-turns: 6
+  rate-limit:
+    chat-per-minute: 30
