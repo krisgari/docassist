@@ -10,6 +10,7 @@ import dev.docassist.common.llm.SourceBlocks;
 import dev.docassist.common.retrieval.RetrievalService;
 import dev.docassist.common.retrieval.RetrievedChunk;
 import dev.docassist.common.security.PermissionService;
+import dev.docassist.common.security.Principals;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -98,8 +99,7 @@ public class AgentTools {
                 }
                 case "start_summary_job" -> {
                     String topic = required(input, "topic");
-                    JobService.JobView job = jobs.submit(st.principals.tenantId(), st.principals.userId(),
-                            "summarize_documents", Map.of("topic", topic));
+                    JobService.JobView job = startSummaryJob(st.principals, topic);
                     st.jobId = job.jobId();
                     events.job(job);
                     ObjectNode r = mapper.createObjectNode();
@@ -130,22 +130,57 @@ public class AgentTools {
 
     private record SearchSummary(Outcome outcome, String summary) {}
 
-    private SearchSummary search(String query, JsonNode input, TurnState st) {
+    /** Structured search result shared by the in-process loop and the LangGraph agent's internal API. */
+    public record Passages(List<RetrievedChunk> passages, int candidates, boolean cacheHit, long millis,
+                           List<String> deniedDocIds) {}
+
+    /** Hybrid search, live permission check, then small-to-big expansion. No numbering, no budget: the caller owns those. */
+    public Passages searchPassages(Principals principals, String query, JsonNode input) {
         RetrievalService.Filters filters = new RetrievalService.Filters(
                 text(input, "doc_type"), null, date(input, "modified_after"),
                 !input.has("include_superseded") || input.path("include_superseded").asBoolean(true));
-        RetrievalService.Result r = retrieval.search(st.principals, query, filters);
-        st.passagesConsidered += r.candidates();
-
+        RetrievalService.Result r = retrieval.search(principals, query, filters);
         Set<String> docIds = new LinkedHashSet<>();
         for (RetrievedChunk c : r.chunks()) docIds.add(c.docId());
-        PermissionService.LateCheckResult check = permissions.lateCheck(st.principals, docIds);
-        if (!check.deniedDocIds().isEmpty()) {
-            st.dropped.addAll(check.deniedDocIds());
-            st.guardrail("acl_late_check_drop", check.deniedDocIds().size() + " document(s) removed by live permission check");
-        }
+        PermissionService.LateCheckResult check = permissions.lateCheck(principals, docIds);
         List<RetrievedChunk> allowed = r.chunks().stream().filter(c -> check.allowedDocIds().contains(c.docId())).toList();
-        List<RetrievedChunk> expanded = retrieval.expandToSections(st.principals.tenantId(), allowed, 700);
+        List<RetrievedChunk> expanded = retrieval.expandToSections(principals.tenantId(), allowed, 700);
+        List<RetrievedChunk> unique = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (RetrievedChunk c : expanded) if (seen.add(c.docId() + "#" + c.parentOrdinal())) unique.add(c);
+        return new Passages(unique, r.candidates(), r.cacheHit(), r.millis(), check.deniedDocIds());
+    }
+
+    /** Whole document by section, permission-checked. Empty when missing or not accessible (indistinguishable on purpose). */
+    public List<RetrievedChunk> fetchPassages(Principals principals, String docId) {
+        PermissionService.LateCheckResult check = permissions.lateCheck(principals, List.of(docId));
+        if (check.allowedDocIds().isEmpty()) return List.of();
+        List<RetrievedChunk> chunks = retrieval.documentChunks(principals.tenantId(), principals.all().toArray(new String[0]), docId);
+        Map<Integer, StringBuilder> sections = new LinkedHashMap<>();
+        Map<Integer, RetrievedChunk> firsts = new LinkedHashMap<>();
+        for (RetrievedChunk c : chunks) {
+            sections.computeIfAbsent(c.parentOrdinal(), k -> new StringBuilder()).append(c.body()).append("\n\n");
+            firsts.putIfAbsent(c.parentOrdinal(), c);
+        }
+        List<RetrievedChunk> out = new ArrayList<>();
+        for (Map.Entry<Integer, StringBuilder> e : sections.entrySet()) {
+            out.add(firsts.get(e.getKey()).withBody(e.getValue().toString().strip()));
+        }
+        return out;
+    }
+
+    public JobService.JobView startSummaryJob(Principals principals, String topic) {
+        return jobs.submit(principals.tenantId(), principals.userId(), "summarize_documents", Map.of("topic", topic));
+    }
+
+    private SearchSummary search(String query, JsonNode input, TurnState st) {
+        Passages r = searchPassages(st.principals, query, input);
+        st.passagesConsidered += r.candidates();
+        if (!r.deniedDocIds().isEmpty()) {
+            st.dropped.addAll(r.deniedDocIds());
+            st.guardrail("acl_late_check_drop", r.deniedDocIds().size() + " document(s) removed by live permission check");
+        }
+        List<RetrievedChunk> expanded = r.passages();
 
         List<SourceBlocks.Source> blocks = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
@@ -172,19 +207,11 @@ public class AgentTools {
     }
 
     private Outcome fetch(String docId, TurnState st) {
-        PermissionService.LateCheckResult check = permissions.lateCheck(st.principals, List.of(docId));
+        List<RetrievedChunk> sections = fetchPassages(st.principals, docId);
         // Same response for "doesn't exist" and "no access": never confirm a document exists to someone who can't see it.
-        if (check.allowedDocIds().isEmpty()) return error("not_found", false, "No accessible document with that id.");
-        List<RetrievedChunk> chunks = retrieval.documentChunks(st.principals.tenantId(), st.principals.all().toArray(new String[0]), docId);
-        Map<Integer, StringBuilder> sections = new LinkedHashMap<>();
-        Map<Integer, RetrievedChunk> firsts = new LinkedHashMap<>();
-        for (RetrievedChunk c : chunks) {
-            sections.computeIfAbsent(c.parentOrdinal(), k -> new StringBuilder()).append(c.body()).append("\n\n");
-            firsts.putIfAbsent(c.parentOrdinal(), c);
-        }
+        if (sections.isEmpty()) return error("not_found", false, "No accessible document with that id.");
         List<SourceBlocks.Source> blocks = new ArrayList<>();
-        for (Map.Entry<Integer, StringBuilder> e : sections.entrySet()) {
-            RetrievedChunk c = firsts.get(e.getKey()).withBody(e.getValue().toString().strip());
+        for (RetrievedChunk c : sections) {
             int tokens = c.body().length() / 4;
             if (st.contextTokens + tokens > maxContextTokens) {
                 st.guardrail("context_budget", "Document truncated at " + st.contextTokens + " tokens");
@@ -221,14 +248,14 @@ public class AgentTools {
         }
     }
 
-    private static String required(JsonNode input, String field) {
+    static String required(JsonNode input, String field) {
         String v = text(input, field);
         if (v == null) throw new IllegalArgumentException("missing required argument '" + field + "'");
         if (v.length() > 500) throw new IllegalArgumentException("'" + field + "' is too long");
         return v;
     }
 
-    private static String text(JsonNode input, String field) {
+    static String text(JsonNode input, String field) {
         JsonNode n = input.path(field);
         return n.isTextual() && !n.asText().isBlank() ? n.asText().trim() : null;
     }

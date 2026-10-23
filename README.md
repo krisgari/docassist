@@ -1,6 +1,6 @@
 # docassist — a permission-aware document assistant
 
-An agentic assistant that answers employees' questions from internal documents. Every claim cites the passage it came from, and nobody sees content they couldn't open in the source system. It was built as an enterprise reference implementation: Spring Boot services, Kafka for ingestion and background jobs, Postgres with pgvector for hybrid search, Redis for caching, Claude for the agent, and a React UI that makes the safeguards visible.
+An agentic assistant that answers employees' questions from internal documents. Every claim cites the passage it came from, and nobody sees content they couldn't open in the source system. It was built as an enterprise reference implementation: Spring Boot services, Kafka for ingestion and background jobs, Postgres with pgvector for hybrid search, Redis for caching, a LangGraph agent driving Claude, and a React UI that makes the safeguards visible.
 
 The demo company is a fictional robotics firm, Halcyon Robotics. It has 14 documents and 5 employees with different access. Everything runs offline without an API key: a deterministic mock model drives the same agent loop. Add `ANTHROPIC_API_KEY` to switch to Claude.
 
@@ -21,24 +21,36 @@ Pick a person on the left and ask a starter question. Then switch to Erin, a con
 | Worker admin | http://localhost:8090/admin/connector, `POST /admin/sync` |
 | Kafka UI | `make tools`, then http://localhost:8081 |
 
-Run the evals against the running stack with `make evals`, and the unit tests with `make test`.
+Run the evals against the running stack with `make evals`, the Java unit tests with `make test`, and the LangGraph agent tests with `make agent-test`.
 
 ## Architecture
 
 ```
  corpus/*.md ──► FilesystemConnector ──► Kafka: doc.events ──► ingest (chunk → scan → embed → write) ──► Postgres + pgvector
- (stand-in for       (delta scan,          acl.events ──────► ACL fast path (≤ seconds)                      ▲   │
-  SharePoint/Drive)   every 5 s)                                                                              │   │ hybrid search,
-                                                                                                              │   │ ACL filter in-query
- Browser ──► nginx ──► query-api ──► agent loop (Claude tool use) ──► search_docs / fetch_doc ────────────────┘   │
-   ▲  SSE                │                    │                  └──► start_summary_job ──► Kafka: jobs.requests ──► job worker
-   └─────────────────────┘◄── jobs.events ◄───┼───────────────────────────────────────────────────────────────── (map/reduce,
-                                              ▼                                                                    checkpoints)
-                         grounding check → redaction → audit log → answer with citations
+ (stand-in for       (delta scan,          acl.events ──────► ACL fast path (≤ seconds)                      ▲
+  SharePoint/Drive)   every 5 s)                                                                              │ hybrid search,
+                                                                                                              │ ACL filter in-query
+ Browser ──► nginx ──► query-api (gateway: auth, rate limit) ──SSE relay──► agent service (Python, LangGraph)  │
+   ▲  SSE                │      ▲                                                  │ tool calls, as the user    │
+   │                     │      └── /internal/agent: search · fetch · jobs ◄───────┘ (user JWT + service token)│
+   │                     │          verify · extractive · finalize ───────────────────────────────────────────┘
+   │                     └── start_summary_job ──► Kafka: jobs.requests ──► job worker (map/reduce, checkpoints)
+   └──────────────────────────── jobs.events ◄──────────────────────────────┘
 ```
 
+**The split:** LangGraph decides *what to do next*. Java decides *what is allowed* and *what the user sees*. The agent service has no database, index or audit access of its own: every tool call goes back to the Java API carrying the user's token, so permissions are enforced in one tested place whichever orchestrator runs.
+
+```
+ START → agent ─┬─ tool calls ──→ tools ──→ agent          (bounded by model-call, tool-call and time budgets)
+                ├─ final draft ─→ verify ─┬─ supported ─────→ finalize → END
+                │                         ├─ unsupported, 1st → revise → agent
+                │                         └─ unsupported, 2nd → fallback → finalize
+                └─ budget hit / model down ───────────────→ fallback → finalize
+```
+
+**Agent** (`agent/`): FastAPI + LangGraph `StateGraph`. Nodes for the model turn (Claude via `langchain-anthropic`, failover to the fast model), tool execution, verification, revision, extractive fallback and finalize. Progress streams through LangGraph's custom stream mode.
+**Query API** (`backend/query-api`): JWT auth, rate limiting, the SSE gateway to the agent, the internal agent API, the output policy (grounding strip, redaction, citations, cost, audit), jobs, feedback and the ops view. It also contains the original in-process Java loop, selectable with `DOCASSIST_ORCHESTRATOR=java` for comparison.
 **Worker** (`backend/worker`): connector, Kafka consumers with retry topics and dead-letter topics, the index writer, ACL sync, and async jobs.
-**Query API** (`backend/query-api`): JWT auth, the agent loop, tools, guardrails, SSE streaming, jobs, feedback, audit and the ops view.
 **Common** (`backend/common`): chunker, embedders, hybrid retrieval, permissions, guardrails, Claude client, mock model, Kafka contracts and the schema.
 
 ## What makes it enterprise-ready
@@ -52,7 +64,8 @@ Run the evals against the running stack with `make evals`, and the unit tests wi
 | Caching | Prompt caching on the stable system and tools prefix. Query embeddings are cached. Retrieval results are cached as ids under an ACL fingerprint plus the index version, so a write invalidates them instantly. Group membership has a short TTL. | `CacheKeys`, `CachingEmbedder` |
 | Slow tools | Summaries run as Kafka jobs with idempotency keys, per-document checkpoints, retry topics, and an execution-time permission check. Progress streams back over SSE. | `JobWorker`, `JobService`, `JobEventHub` |
 | Guardrails | Retrieved text is treated as data, and injection patterns are flagged. Tools are read-only. A grounding check runs with one revision, then falls back to an extractive answer. Secrets and PII are redacted. Every turn is rate-limited and audited. | `guardrails/*`, `AgentService` |
-| Model or tool errors | Retries with backoff and jitter honour `retry-after`. Failover goes to the fallback model. Tools return structured errors the model can act on. Hard limits cap model calls, tool calls and wall-clock time. | `AnthropicClient`, `AgentService` |
+| Orchestration | LangGraph state machine with explicit nodes and conditional edges; per-request dependencies passed through config, never stored in state; custom stream events for live progress. | `agent/app/graph.py` |
+| Model or tool errors | SDK retries with backoff, then failover to the fallback model. Tools return structured errors the model can act on. Hard limits cap model calls, tool calls and wall-clock time, with LangGraph's recursion limit as a backstop. | `agent/app/graph.py`, `agent/app/errors.py` |
 | Evals | A 28-question golden set covers single-doc, tables, identifiers, conflicting sources, unanswerable questions, permission traps and safety slices. Gates are enforced in CI, with regression checks against a baseline. | `evals/` |
 | Cost | Token usage per model is converted with configurable prices. Cost is returned per answer, stored in the audit log, and shown in the UI and the ops view. | `CostCalculator` |
 | Observability | Prometheus metrics: retrieval latency, answer latency and cost, outcomes, ACL propagation, dead letters, embeddings reused. The ops view shows recent traces, safeguards fired and index freshness. | `/actuator/prometheus`, Operations tab |
@@ -77,7 +90,9 @@ All settings are environment variables (see `.env.example`) or `docassist-common
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | empty | Empty means the mock model runs the same agent loop offline |
+| `ANTHROPIC_API_KEY` | empty | Empty means the mock model runs the same agent graph offline |
+| `DOCASSIST_ORCHESTRATOR` | `langgraph` | `langgraph` (Python agent service) or `java` (in-process loop) |
+| `DOCASSIST_INTERNAL_TOKEN` | dev value | Service-to-service secret between query-api and the agent; set a real one outside local dev |
 | `DOCASSIST_LLM_MODEL` / `_FAST_MODEL` | `claude-sonnet-5-5` / `claude-haiku-5-5` | Agent and synthesis model / failover and map-step model |
 | `DOCASSIST_EMBEDDINGS_PROVIDER` | `local` | `local` (feature hashing, offline) or `voyage` (needs `VOYAGE_API_KEY`) |
 | `DOCASSIST_JWT_SECRET` | dev value | Signs demo tokens; replace with your IdP in production |
@@ -95,9 +110,10 @@ All settings are environment variables (see `.env.example`) or `docassist-common
 ## Project layout
 
 ```
+agent/              LangGraph agent service (FastAPI): graph, tools, backend client, tests
 backend/common      shared core + Flyway schema (V1 schema, V2 demo identities)
 backend/worker      connector, ingest consumers, job worker
-backend/query-api   auth, agent, tools, chat SSE, jobs, feedback, insights
+backend/query-api   auth, gateway, internal agent API, output policy, jobs, feedback, insights
 ui/                 React + Vite; nginx config for same-origin API proxy
 corpus/             14 synthetic documents with ACL front matter
 evals/              golden.jsonl, run_evals.py (stdlib only)

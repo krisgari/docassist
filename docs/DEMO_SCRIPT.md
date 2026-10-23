@@ -57,7 +57,16 @@ Switch to **Dave**, then **Operations**.
 - Show a thumbs-down flowing in: every flagged answer is triaged from its trace into one bucket (retrieval miss, ranking miss, generation error, stale source, or permissions gap) and becomes a regression case in `evals/golden.jsonl`.
 - Run `make evals` live if there's time: 28 questions, with gates on citation hit, correctness, abstention, and zero leaks.
 
+## 8. The orchestration (1 min, if they ask how the agent works)
+
+Open `agent/app/graph.py`. The docstring diagram is the whole agent: agent → tools loop, then verify, with revise and fallback branches. Point out:
+- LangGraph decides the next step; the Java API decides what's allowed. The agent forwards the user's token and has no database access, so even a fully prompt-injected agent can only see what that user can see.
+- Budgets (model calls, tool calls, wall clock) are checked in the agent node; LangGraph's recursion limit is the backstop.
+- `DOCASSIST_ORCHESTRATOR=java` switches to the hand-written Java loop with the same tools and output policy. Run `make evals` in both modes to compare.
+
 ## Likely questions and short answers
+
+- **Why LangGraph and Java together?** Each does what it's good at. LangGraph gives an explicit, testable state machine for the agent and the Python AI ecosystem. Java and Spring hold the enterprise concerns: identity, permissions, transactions, Kafka, audit.
 
 - **Why Kafka, not just a queue?** Ordered per-document partitions (an edit can't overtake a delete), replay for re-indexing, independent consumer groups (ingest, ACL sync, jobs, SSE fan-out), and retry and dead-letter topics built into Spring Kafka.
 - **Why Postgres + pgvector rather than a vector DB?** One transactional store for documents, chunks, ACLs, jobs and audit. Hybrid search and filters run in one query. HNSW with iterative scans avoids filter starvation. Move to OpenSearch or Vespa past tens of millions of chunks.

@@ -169,9 +169,22 @@ public class AgentService {
             if (report.failureRate() > maxGroundingFailure) {
                 finalText = fallbackAnswer(question, st, "answer failed the grounding check");
                 usedFallback = true;
-            } else {
-                finalText = stripUnsupported(finalText, report, st);
             }
+        }
+        return finalizeAnswer(user, question, finalText, usedFallback, st, System.currentTimeMillis() - start, llm.model());
+    }
+
+    /**
+     * The output policy every answer passes through, whichever orchestrator produced it (this loop or the LangGraph
+     * agent): strip statements the sources don't support, drop citations that point nowhere, redact secrets and
+     * PII, build citations, classify the outcome, price the tokens and write the audit record.
+     */
+    AgentModels.Result finalizeAnswer(CurrentUser user, String question, String draft, boolean usedFallback,
+                                      TurnState st, long latencyMs, String model) {
+        String finalText = draft == null ? "" : draft;
+        if (!usedFallback && !st.sources.isEmpty()) {
+            GroundingChecker.Report report = grounding.check(finalText, st.sourceTexts());
+            finalText = stripUnsupported(finalText, report, st);
             if (!report.invalidCitations().isEmpty()) {
                 st.guardrail("invalid_citation_removed", report.invalidCitations().toString());
                 for (Integer n : report.invalidCitations()) finalText = finalText.replace("[" + n + "]", "");
@@ -182,7 +195,6 @@ public class AgentService {
         if (red.changed()) st.guardrail("sensitive_data_redacted", String.join(", ", red.redactedTypes()));
         finalText = red.text();
 
-        // ---------------- result, cost, audit ----------------
         List<AgentModels.Citation> citations = citations(finalText, st);
         String outcome = outcome(finalText, citations, usedFallback, st);
         List<AgentModels.Usage> usage = new ArrayList<>();
@@ -197,13 +209,12 @@ public class AgentService {
             outTok += u.outputTokens();
             usage.add(new AgentModels.Usage(u.model(), u.inputTokens(), u.outputTokens(), u.cacheReadTokens(), c));
         }
-        long latency = System.currentTimeMillis() - start;
 
         String auditId = null;
         try {
             auditId = audit.record(new AuditService.Entry(user.tenantId(), user.userId(), question, finalText,
                     List.copyOf(st.retrievedDocs), citations.stream().map(AgentModels.Citation::docId).distinct().toList(),
-                    List.copyOf(st.dropped), st.guardrails, st.trace, llm.model(), inTok, outTok, cost, latency, outcome))
+                    List.copyOf(st.dropped), st.guardrails, st.trace, model, inTok, outTok, cost, latencyMs, outcome))
                     .toString();
         } catch (RuntimeException e) {
             log.error("audit write failed", e); // never lose the answer because the audit insert failed; alert on this
@@ -211,10 +222,19 @@ public class AgentService {
 
         meters.counter("docassist.answers", "outcome", outcome).increment();
         meters.summary("docassist.answer.cost_usd").record(cost);
-        meters.timer("docassist.answer.latency").record(java.time.Duration.ofMillis(latency));
+        meters.timer("docassist.answer.latency").record(java.time.Duration.ofMillis(latencyMs));
 
         return new AgentModels.Result(finalText, outcome, citations, st.trace, st.guardrails, List.copyOf(st.dropped),
-                st.passagesConsidered, usage, cost, latency, auditId, st.jobId);
+                st.passagesConsidered, usage, cost, latencyMs, auditId, st.jobId);
+    }
+
+    /** Grounding report for a draft, used by the LangGraph agent's verify node. */
+    GroundingChecker.Report groundingReport(String draft, TurnState st) {
+        return grounding.check(draft, st.sourceTexts());
+    }
+
+    double maxGroundingFailure() {
+        return maxGroundingFailure;
     }
 
     /** Primary model first; on a retryable provider error, one attempt on the fallback model. */
@@ -234,7 +254,7 @@ public class AgentService {
         }
     }
 
-    private String fallbackAnswer(String question, TurnState st, String reason) {
+    String fallbackAnswer(String question, TurnState st, String reason) {
         if (st.sources.isEmpty() && "model unavailable".equals(reason)) return UNAVAILABLE;
         st.guardrail("extractive_fallback", reason);
         ExtractiveAnswerer.Answer a = extractive.answer(question, st.asBlocks());
@@ -260,7 +280,7 @@ public class AgentService {
         return out;
     }
 
-    private static String listFailing(GroundingChecker.Report report) {
+    static String listFailing(GroundingChecker.Report report) {
         StringBuilder sb = new StringBuilder();
         for (GroundingChecker.SentenceCheck s : report.sentences()) {
             if (s.status() == GroundingChecker.Status.UNSUPPORTED || s.status() == GroundingChecker.Status.UNCITED) {

@@ -1,7 +1,7 @@
 name: docassist
 
 # One-command local stack: `docker compose up --build`
-# UI: http://localhost:3000   API: http://localhost:8080   Kafka UI (profile "tools"): http://localhost:8081
+# UI: http://localhost:3000   API: http://localhost:8080   (agent service is internal, port 8070)   Kafka UI (profile "tools"): http://localhost:8081
 
 x-backend-env: &backend-env
   SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/docassist
@@ -16,6 +16,7 @@ x-backend-env: &backend-env
   DOCASSIST_EMBEDDINGS_PROVIDER: ${DOCASSIST_EMBEDDINGS_PROVIDER:-local}
   VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
   DOCASSIST_TENANT: acme
+  DOCASSIST_INTERNAL_TOKEN: ${DOCASSIST_INTERNAL_TOKEN:-dev-internal-token-change-me}
 
 services:
   postgres:
@@ -89,6 +90,9 @@ services:
       <<: *backend-env
       DOCASSIST_JWT_SECRET: ${DOCASSIST_JWT_SECRET:-change-me-local-dev-secret-at-least-32-bytes!!}
       DOCASSIST_DEMO_LOGIN_ENABLED: "true"
+      # langgraph = the Python LangGraph service orchestrates the agent; java = the in-process loop
+      DOCASSIST_ORCHESTRATOR: ${DOCASSIST_ORCHESTRATOR:-langgraph}
+      DOCASSIST_AGENT_URL: http://agent:8070
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -100,11 +104,23 @@ services:
       timeout: 5s
       retries: 30
 
+  agent:
+    # LangGraph orchestration. Not published to the host: only query-api calls it.
+    build: ./agent
+    environment:
+      DOCASSIST_API_URL: http://query-api:8080
+      DOCASSIST_INTERNAL_TOKEN: ${DOCASSIST_INTERNAL_TOKEN:-dev-internal-token-change-me}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DOCASSIST_LLM_PROVIDER: ${DOCASSIST_LLM_PROVIDER:-auto}
+      DOCASSIST_LLM_MODEL: ${DOCASSIST_LLM_MODEL:-claude-sonnet-5-5}
+      DOCASSIST_LLM_FAST_MODEL: ${DOCASSIST_LLM_FAST_MODEL:-claude-haiku-5-5}
+
   ui:
     build: ./ui
     ports: ["3000:80"]
     depends_on:
       query-api: { condition: service_healthy }
+      agent: { condition: service_healthy }
 
   kafka-ui:
     profiles: ["tools"]

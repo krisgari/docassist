@@ -20,6 +20,10 @@ docassist:
     token-ttl-minutes: 480
     demo-login-enabled: ${DOCASSIST_DEMO_LOGIN_ENABLED:true}
   agent:
+    # langgraph = the Python LangGraph agent service orchestrates; java = the in-process loop (AgentService)
+    orchestrator: ${DOCASSIST_ORCHESTRATOR:langgraph}
+    url: ${DOCASSIST_AGENT_URL:http://localhost:8070}
+    internal-token: ${DOCASSIST_INTERNAL_TOKEN:dev-internal-token-change-me}
     max-model-calls: 6
     max-tool-calls: 8
     sync-budget-seconds: 25

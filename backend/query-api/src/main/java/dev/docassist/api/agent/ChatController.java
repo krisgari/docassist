@@ -9,6 +9,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -27,7 +28,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * POST /api/chat streams Server-Sent Events: "status" and "tool" while the agent works, "job" when it starts a
+ * POST /api/chat streams Server-Sent Events. By default the turn is orchestrated by the LangGraph agent service
+ * (relayed by {@link LangGraphGateway}); DOCASSIST_ORCHESTRATOR=java runs the in-process loop instead. Events: "status" and "tool" while the agent works, "job" when it starts a
  * background job, then one "answer" (or "error"). Each request runs on a virtual thread.
  */
 @RestController
@@ -39,14 +41,20 @@ public class ChatController {
     public record ChatRequest(@NotBlank @Size(max = 2000) String question, List<AgentModels.Turn> history) {}
 
     private final AgentService agent;
+    private final LangGraphGateway langGraph;
     private final RateLimiter rateLimiter;
     private final ObjectMapper mapper;
+    private final boolean useLangGraph;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-    public ChatController(AgentService agent, RateLimiter rateLimiter, ObjectMapper mapper) {
+    public ChatController(AgentService agent, LangGraphGateway langGraph, RateLimiter rateLimiter, ObjectMapper mapper,
+                          @Value("${docassist.agent.orchestrator}") String orchestrator) {
         this.agent = agent;
+        this.langGraph = langGraph;
         this.rateLimiter = rateLimiter;
         this.mapper = mapper;
+        this.useLangGraph = "langgraph".equalsIgnoreCase(orchestrator);
+        log.info("agent orchestrator: {}", useLangGraph ? "langgraph" : "java");
     }
 
     @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -56,6 +64,13 @@ public class ChatController {
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Too many questions in the last minute.");
         }
         SseEmitter emitter = new SseEmitter(120_000L);
+        if (useLangGraph) {
+            executor.submit(() -> {
+                langGraph.relay(jwt.getTokenValue(), req.question().trim(), req.history(), emitter);
+                emitter.complete();
+            });
+            return emitter;
+        }
         executor.submit(() -> {
             try {
                 AgentModels.Result result = agent.run(user, req.question().trim(), req.history(), new AgentModels.Events() {

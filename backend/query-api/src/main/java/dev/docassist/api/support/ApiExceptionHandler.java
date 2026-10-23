@@ -24,6 +24,13 @@ public class ApiExceptionHandler {
                 "message", e.getBindingResult().getAllErrors().get(0).getDefaultMessage()));
     }
 
+    /** Bad tool arguments from the agent (missing query, malformed date) are the caller's error, not a 500. */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> badArgument(IllegalArgumentException e) {
+        return ResponseEntity.badRequest().body(Map.of("error", "invalid_request",
+                "message", e.getMessage() == null ? "invalid request" : e.getMessage()));
+    }
+
     @ExceptionHandler(ResponseStatusException.class)
     public ResponseEntity<Map<String, Object>> status(ResponseStatusException e) {
         return ResponseEntity.status(e.getStatusCode()).body(Map.of("error", e.getStatusCode().toString(),

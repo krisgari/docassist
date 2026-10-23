@@ -28,17 +28,29 @@ jobs:
         run: npm run build
         working-directory: ui
 
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements-dev.txt
+        working-directory: agent
+      - name: LangGraph agent tests
+        run: python -m pytest -q
+        working-directory: agent
+
   evals:
     # Full stack in mock mode (no API key): proves permissions, guardrails and the eval gates on every PR.
     # Add ANTHROPIC_API_KEY as a secret and set DOCASSIST_LLM_PROVIDER=anthropic in a nightly job to gate the real model.
-    needs: [backend, ui]
+    needs: [backend, ui, agent]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Scorer self-test
         run: python3 evals/run_evals.py --self-test
       - name: Start stack
-        run: docker compose up -d --build postgres redis kafka worker query-api
+        run: docker compose up -d --build postgres redis kafka worker query-api agent
       - name: Wait for API and initial ingest
         run: |
           for i in $(seq 1 60); do
@@ -59,4 +71,4 @@ jobs:
         with: { name: eval-report, path: evals/reports/ }
       - name: Logs on failure
         if: failure()
-        run: docker compose logs worker query-api | tail -300
+        run: docker compose logs worker query-api agent | tail -300
