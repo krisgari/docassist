@@ -17,6 +17,7 @@ export function Thread({
   onAsk,
   onSelect,
   onFeedback,
+  onNewConversation,
   personName,
 }: {
   messages: Message[];
@@ -26,6 +27,7 @@ export function Thread({
   onAsk: (q: string) => void;
   onSelect: (s: Selection) => void;
   onFeedback: (m: Message, rating: 1 | -1) => void;
+  onNewConversation: () => void;
   personName: string;
 }) {
   const [draft, setDraft] = useState("");
@@ -150,9 +152,16 @@ export function Thread({
           }}
           maxLength={2000}
         />
-        <button type="submit" disabled={busy || !draft.trim()}>
-          Ask
-        </button>
+        <div className="composer-actions">
+          <button type="submit" disabled={busy || !draft.trim()}>
+            Ask
+          </button>
+          {messages.length > 0 && (
+            <button type="button" className="link" onClick={onNewConversation} disabled={busy}>
+              New conversation
+            </button>
+          )}
+        </div>
       </form>
     </section>
   );

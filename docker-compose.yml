@@ -1,14 +1,16 @@
 name: docassist
 
 # One-command local stack: `docker compose up --build`
-# UI: http://localhost:3000   API: http://localhost:8080   (agent service is internal, port 8070)   Kafka UI (profile "tools"): http://localhost:8081
+#   UI            http://localhost:3000
+#   Query API     http://localhost:8080   (MCP server at /mcp/)
+#   Worker admin  http://localhost:8090/admin/connector
+#   Kafka UI      http://localhost:8081   (profile "tools")
+#   Jaeger        http://localhost:16686  (profile "observability"; set OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318)
+#
+# Planes: ingestion = worker (Spring Boot + Kafka). query = query (Python: FastAPI + LangGraph).
+# Their only contract: the Postgres schema (owned by the worker's Flyway migrations), Kafka topics, Redis keys.
 
-x-backend-env: &backend-env
-  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/docassist
-  SPRING_DATASOURCE_USERNAME: docassist
-  SPRING_DATASOURCE_PASSWORD: docassist
-  SPRING_DATA_REDIS_HOST: redis
-  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+x-llm-env: &llm-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   DOCASSIST_LLM_PROVIDER: ${DOCASSIST_LLM_PROVIDER:-auto}
   DOCASSIST_LLM_MODEL: ${DOCASSIST_LLM_MODEL:-claude-sonnet-5-5}
@@ -16,7 +18,6 @@ x-backend-env: &backend-env
   DOCASSIST_EMBEDDINGS_PROVIDER: ${DOCASSIST_EMBEDDINGS_PROVIDER:-local}
   VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
   DOCASSIST_TENANT: acme
-  DOCASSIST_INTERNAL_TOKEN: ${DOCASSIST_INTERNAL_TOKEN:-dev-internal-token-change-me}
 
 services:
   postgres:
@@ -25,7 +26,7 @@ services:
       POSTGRES_DB: docassist
       POSTGRES_USER: docassist
       POSTGRES_PASSWORD: docassist
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U docassist -d docassist"]
@@ -35,7 +36,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -66,12 +67,18 @@ services:
       timeout: 10s
       retries: 20
 
+  # ---------------------------------------------------------------- ingestion plane (Spring Boot + Kafka)
   worker:
     build:
-      context: ./backend
+      context: ./ingestion
       args: { MODULE: worker }
     environment:
-      <<: *backend-env
+      <<: *llm-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/docassist
+      SPRING_DATASOURCE_USERNAME: docassist
+      SPRING_DATASOURCE_PASSWORD: docassist
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DOCASSIST_CONNECTOR_ROOT: /corpus
       DOCASSIST_CONNECTOR_SCAN_INTERVAL_MS: 5000
     volumes:
@@ -81,55 +88,54 @@ services:
       redis: { condition: service_healthy }
       kafka: { condition: service_healthy }
     ports: ["8090:8090"]
-
-  query-api:
-    build:
-      context: ./backend
-      args: { MODULE: query-api }
-    environment:
-      <<: *backend-env
-      DOCASSIST_JWT_SECRET: ${DOCASSIST_JWT_SECRET:-change-me-local-dev-secret-at-least-32-bytes!!}
-      DOCASSIST_DEMO_LOGIN_ENABLED: "true"
-      # langgraph = the Python LangGraph service orchestrates the agent; java = the in-process loop
-      DOCASSIST_ORCHESTRATOR: ${DOCASSIST_ORCHESTRATOR:-langgraph}
-      DOCASSIST_AGENT_URL: http://agent:8070
-    depends_on:
-      postgres: { condition: service_healthy }
-      redis: { condition: service_healthy }
-      kafka: { condition: service_healthy }
-    ports: ["8080:8080"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      # Healthy = Flyway migrations applied and Kafka topics created, which the query plane relies on.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8090/actuator/health | grep -q UP"]
       interval: 10s
       timeout: 5s
       retries: 30
 
-  agent:
-    # LangGraph orchestration. Not published to the host: only query-api calls it.
-    build: ./agent
+  # ---------------------------------------------------------------- query plane (Python + LangGraph)
+  query:
+    build: ./query
     environment:
-      DOCASSIST_API_URL: http://query-api:8080
-      DOCASSIST_INTERNAL_TOKEN: ${DOCASSIST_INTERNAL_TOKEN:-dev-internal-token-change-me}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      DOCASSIST_LLM_PROVIDER: ${DOCASSIST_LLM_PROVIDER:-auto}
-      DOCASSIST_LLM_MODEL: ${DOCASSIST_LLM_MODEL:-claude-sonnet-5-5}
-      DOCASSIST_LLM_FAST_MODEL: ${DOCASSIST_LLM_FAST_MODEL:-claude-haiku-5-5}
+      <<: *llm-env
+      DOCASSIST_DATABASE_URL: postgresql://docassist:docassist@postgres:5432/docassist
+      DOCASSIST_REDIS_URL: redis://redis:6379/0
+      DOCASSIST_KAFKA_BOOTSTRAP: kafka:9092
+      DOCASSIST_JWT_SECRET: ${DOCASSIST_JWT_SECRET:-change-me-local-dev-secret-at-least-32-bytes!!}
+      DOCASSIST_DEMO_LOGIN_ENABLED: "true"
+      DOCASSIST_CHECKPOINTER: ${DOCASSIST_CHECKPOINTER:-postgres}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: docassist-query
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+    depends_on:
+      worker: { condition: service_healthy }
+    ports: ["8080:8080"]
 
   ui:
     build: ./ui
     ports: ["3000:80"]
     depends_on:
-      query-api: { condition: service_healthy }
-      agent: { condition: service_healthy }
+      query: { condition: service_healthy }
 
+  # ---------------------------------------------------------------- optional tooling
   kafka-ui:
     profiles: ["tools"]
-    image: provectuslabs/kafka-ui:latest
+    image: provectuslabs/kafka-ui:v0.7.2
     ports: ["8081:8080"]
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     depends_on: [kafka]
+
+  jaeger:
+    profiles: ["observability"]
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686"]
 
 volumes:
   pgdata:

@@ -176,13 +176,15 @@ export function streamChat(
   token: string,
   question: string,
   history: Turn[],
+  conversationId: string,
   onEvent: (event: string, data: unknown) => void,
   signal?: AbortSignal,
 ) {
+  // The server keeps the conversation in its LangGraph checkpointer; history is only used to seed a new thread.
   return fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...auth(token) },
-    body: JSON.stringify({ question, history }),
+    body: JSON.stringify({ question, history, conversationId }),
     signal,
   }).then((res) => readSse(res, onEvent, signal));
 }

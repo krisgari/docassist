@@ -11,12 +11,15 @@ type Session = { token: string; person: Person };
 
 let seq = 0;
 const nextId = () => `m${++seq}`;
+const newConversationId = () =>
+  (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`).replace(/[^A-Za-z0-9_-]/g, "");
 
 export default function App() {
   const [people, setPeople] = useState<Person[]>([]);
   const [sessions, setSessions] = useState<Record<string, Session>>({});
   const [activeId, setActiveId] = useState<string | null>(null);
   const [threads, setThreads] = useState<Record<string, Message[]>>({});
+  const [conversations, setConversations] = useState<Record<string, string>>({});
   const [jobs, setJobs] = useState<Record<string, Job[]>>({});
   const [busy, setBusy] = useState(false);
   const [selection, setSelection] = useState<Selection>(null);
@@ -90,6 +93,8 @@ export default function App() {
       .filter((m) => !m.pending && (m.role === "user" || m.result))
       .map((m) => ({ role: m.role, content: m.role === "user" ? m.text : m.result!.answer }));
     const answerId = nextId();
+    const conversationId = conversations[userId] ?? newConversationId();
+    if (!conversations[userId]) setConversations((prev) => ({ ...prev, [userId]: conversationId }));
     setThreads((prev) => ({
       ...prev,
       [userId]: [
@@ -100,7 +105,7 @@ export default function App() {
     }));
     setBusy(true);
     try {
-      await streamChat(session.token, question, history, (event, data) => {
+      await streamChat(session.token, question, history, conversationId, (event, data) => {
         if (event === "status") patch(userId, answerId, (m) => ({ ...m, status: (data as { message: string }).message }));
         if (event === "tool") patch(userId, answerId, (m) => ({ ...m, tools: [...m.tools, data as ToolTrace] }));
         if (event === "job") {
@@ -135,6 +140,13 @@ export default function App() {
     } catch (e) {
       alert(e instanceof Error ? e.message : "Couldn't start the job");
     }
+  };
+
+  const newConversation = () => {
+    if (!activeId || busy) return;
+    setThreads((prev) => ({ ...prev, [activeId]: [] }));
+    setConversations((prev) => ({ ...prev, [activeId]: newConversationId() }));
+    setSelection(null);
   };
 
   const feedback = async (m: Message, rating: 1 | -1) => {
@@ -193,6 +205,7 @@ export default function App() {
                 onAsk={ask}
                 onSelect={setSelection}
                 onFeedback={feedback}
+                onNewConversation={newConversation}
                 personName={session.person.name.split(" ")[0]}
               />
             ) : (

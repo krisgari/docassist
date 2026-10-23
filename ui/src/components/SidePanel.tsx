@@ -3,6 +3,7 @@ import type { Message, Selection } from "../types";
 const GUARDRAIL_LABEL: Record<string, string> = {
   prompt_injection_flagged: "Instructions found inside a document were treated as data",
   acl_late_check_drop: "Removed by the live permission check",
+  revoked_source_statements_removed: "Statements from documents you can no longer open were removed",
   sensitive_data_redacted: "Sensitive values redacted",
   grounding_revision: "Answer revised after the grounding check",
   unsupported_statements_removed: "Unsupported statements removed",
